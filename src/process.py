@@ -13,7 +13,6 @@
 #  limitations under the License.
 
 import os
-import glob
 import SimpleITK as sitk
 import numpy as np
 
@@ -30,108 +29,135 @@ from pathlib import Path
 import json
 # imports required for my algorithm
 from data_utils import resample_img, CropPancreasROI, GetFullSizDetectionMap, PostProcessing
+import uuid
 
 import warnings
 warnings.filterwarnings("ignore")
+
+def generate_uid():
+    # Generate a UID with a root (usually 2.25 is a private root)
+    # 2.25.xxx where xxx is a large integer derived from UUID
+    uid = "2.25." + str(uuid.uuid4().int % (10**38))
+    return uid
 
 class PDACDetectionContainer(SegmentationAlgorithm):
     def __init__(self):
         super().__init__(
             validators=dict(
-                input_image=(
-                    UniqueImagesValidator(),
-                    UniquePathIndicesValidator(),
-                )
-            ),
+                input_image=(UniqueImagesValidator(), UniquePathIndicesValidator())
+            )
         )
-        # input / output paths for nnUNet
 
-        self.nnunet_input_dir_lowres = Path("/opt/algorithm/nnunet/input_lowres") 
+        base_dir = Path.cwd()  # 👈 Get the folder this script is run in
+
+        self.dicom_input_dir = Path("/DATA_INPUT")  # NEW: DICOM input
+        
+
+        self.nnunet_input_dir_lowres = Path("/opt/algorithm/nnunet/input_lowres")
         self.nnunet_input_dir_fullres = Path("/opt/algorithm/nnunet/input_fullres")
         self.nnunet_output_dir_lowres = Path("/opt/algorithm/nnunet/output_lowres")
         self.nnunet_output_dir_fullres = Path("/opt/algorithm/nnunet/output_fullres")
         self.nnunet_model_dir = Path("/opt/algorithm/nnunet/results")
-       
-        # input / output paths
-        self.ct_ip_dir          = Path("/input/images/venous-ct")
-        self.clinical_info_path = "/input/clinical-information-pancreatic-ct.json"
-        self.output_dir         = Path("/output")
 
-        self.output_dir_images  = Path(os.path.join(self.output_dir,"images")) 
-        self.output_dir_tlm     = Path(os.path.join(self.output_dir_images,"pdac-detection-map")) 
-        self.detection_map      = self.output_dir_tlm / "detection_map.mha"
+        self.output_dir = Path("/DATA_OUTPUT")
+        self.output_dir_images = self.output_dir / "dcm_images"
+        
 
-        # ensure required folders exist
-        self.nnunet_input_dir_lowres.mkdir(exist_ok=True, parents=True)
-        self.nnunet_input_dir_fullres.mkdir(exist_ok=True, parents=True)
-        self.nnunet_output_dir_lowres.mkdir(exist_ok=True, parents=True)
-        self.nnunet_output_dir_fullres.mkdir(exist_ok=True, parents=True)
-        self.output_dir.mkdir(exist_ok=True, parents=True)
-        self.output_dir_tlm.mkdir(exist_ok=True, parents=True)
+        for path in [
+            self.nnunet_input_dir_lowres,
+            self.nnunet_input_dir_fullres,
+            self.nnunet_output_dir_lowres,
+            self.nnunet_output_dir_fullres,
+            self.output_dir,
+            self.output_dir_images
+        ]:
+            path.mkdir(exist_ok=True, parents=True)
+            
 
-        mha_files = glob.glob(os.path.join(self.ct_ip_dir, '*.mha'))
-        print(mha_files)
+    def load_dicom_series(self):
+        reader = sitk.ImageSeriesReader()
+        dicom_names = reader.GetGDCMSeriesFileNames(str(self.dicom_input_dir))
+        print(len(dicom_names))
+        reader.SetFileNames(dicom_names)
+        reader.MetaDataDictionaryArrayUpdateOn() 
+        image = reader.Execute()
+        self.original_dicom_metadata = []
+        for i, filename in enumerate(dicom_names):
+            tags = reader.GetMetaDataKeys(i)
+            meta = {tag: reader.GetMetaData(i, tag) for tag in tags}
+            self.original_dicom_metadata.append(meta)
+        return image
 
-        # Check if any .mha files were found
-        if mha_files:
-            # Assuming you want to read the first .mha file found
-            self.ct_image = mha_files[0]
-        else:
-            print('No mha images found in input directory')
+    def write_dicom_series(self, image, output_dir):
+        image = sitk.Cast(image, sitk.sitkInt16)
+        writer = sitk.ImageFileWriter()
+        writer.KeepOriginalImageUIDOn()
+
+        study_uid = self.original_dicom_metadata[0].get("0020|000D")
+        if study_uid is None:
+            print("Warning: StudyInstanceUID not found, generating new one.")
+            study_uid = generate_uid()
+        series_uid = generate_uid()
+
+        for i in range(image.GetDepth()):
+            slice_image = image[:, :, i]
+            out_path = os.path.join(output_dir, f"{i:04d}.dcm")
+
+            # Apply metadata from original slice if available
+            for key in self.original_dicom_metadata[i].keys():
+                value = self.original_dicom_metadata[i][key]
+                slice_image.SetMetaData(key, value)
+
+
+            slice_image.SetMetaData("0008|103e", "PDAC Detection Map")
+            slice_image.SetMetaData("0020|000D", study_uid) 
+            slice_image.SetMetaData("0020|000e", series_uid)
+
+            writer.SetFileName(out_path)
+            writer.Execute(slice_image)
 
     def process(self):
-        """
-        Load CT scan and Generate Heatmap for Pancreas Cancer  
-        """
+        itk_img = self.load_dicom_series()
+        image_size = itk_img.GetSize()
+        print(f"Image size: {image_size}") 
 
-        itk_img = sitk.ReadImage(self.ct_image, sitk.sitkFloat32)
-        with open(self.clinical_info_path, 'r') as file:
-            clinical_info = json.load(file)
-        print('Clinical Information:')
-        print('age:', clinical_info['age'])
-        print('sex:',clinical_info['sex'])
-        print('study date:',clinical_info['study_date'])
-        print('scanner:',clinical_info['scanner'])
-
-        #Get low resolution pancreas segmentation 
-        #dowsample image to (4.5, 4.5, 9.0)
+        # Step 1: Downsample image for low-res pancreas segmentation
         new_spacing = (4.5, 4.5, 9.0)
-        image_resampled = resample_img(itk_img, new_spacing, is_label=False, out_size = [])
+        image_resampled = resample_img(itk_img, new_spacing, is_label=False, out_size=[])
         sitk.WriteImage(image_resampled, str(self.nnunet_input_dir_lowres / "scan_0000.nii.gz"))
 
-        #predict pancreas mask using nnUnet
+        # Step 2: Low-res pancreas mask prediction
         self.predict(
             input_dir=self.nnunet_input_dir_lowres,
             output_dir=self.nnunet_output_dir_lowres,
             task="Dataset103_PANORAMA_baseline_Pancreas_Segmentation"
         )
+        mask_low_res = sitk.ReadImage(str(self.nnunet_output_dir_lowres / "scan.nii.gz"))
 
-        mask_pred_path = str(self.nnunet_output_dir_lowres / "scan.nii.gz")
-        mask_low_res = sitk.ReadImage(mask_pred_path)
-
-        crop_margins = [100,50,15]
-        cropped_image, crop_coordinates = CropPancreasROI(itk_img, mask_low_res, crop_margins)
-
+        # Step 3: Crop image around pancreas
+        cropped_image, crop_coordinates = CropPancreasROI(itk_img, mask_low_res, [100, 50, 15])
         sitk.WriteImage(cropped_image, str(self.nnunet_input_dir_fullres / "scan_0000.nii.gz"))
 
+        # Step 4: Full-res detection
         self.predict(
-        input_dir=self.nnunet_input_dir_fullres,
-        output_dir=self.nnunet_output_dir_fullres,
-        task="Dataset104_PANORAMA_baseline_PDAC_Detection",
-        trainer="nnUNetTrainer_Loss_CE_checkpoints",
-        checkpoint= 'checkpoint_best_panorama.pth'
+            input_dir=self.nnunet_input_dir_fullres,
+            output_dir=self.nnunet_output_dir_fullres,
+            task="Dataset104_PANORAMA_baseline_PDAC_Detection",
+            trainer="nnUNetTrainer_Loss_CE_checkpoints",
+            checkpoint='checkpoint_best_panorama.pth'
         )
 
-        pred_path_npz = str(self.nnunet_output_dir_fullres / "scan.npz")
-        prediction = np.load(pred_path_npz)
-        pred_path_nifti = str(self.nnunet_output_dir_fullres / "scan.nii.gz")
+        pred_npz = np.load(str(self.nnunet_output_dir_fullres / "scan.npz"))
+        pred_nifti = str(self.nnunet_output_dir_fullres / "scan.nii.gz")
+        prediction_postprocessed = PostProcessing(pred_npz, pred_nifti)
+        detection_map, patient_level_prediction = GetFullSizDetectionMap(
+            prediction_postprocessed, crop_coordinates, itk_img
+        )
 
-        prediction_postprocessed = PostProcessing(prediction, pred_path_nifti)
-        detection_map, patient_level_prediction = GetFullSizDetectionMap(prediction_postprocessed, crop_coordinates, itk_img)
-        
-        sitk.WriteImage(detection_map, self.detection_map)
+        # NEW: Write detection map as DICOM series
+        self.write_dicom_series(detection_map, self.output_dir_images)
+
         write_json_file(location=self.output_dir / "pdac-likelihood.json", content=patient_level_prediction)
-
 
 
 
@@ -167,8 +193,6 @@ class PDACDetectionContainer(SegmentationAlgorithm):
 
             if store_probability_maps:
                 cmd.append('--save_probabilities')
-
-
 
             cmd_str = " ".join(cmd)
             subprocess.check_call(cmd_str, shell=True)

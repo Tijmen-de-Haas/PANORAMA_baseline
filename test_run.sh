@@ -7,7 +7,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 DOCKER_TAG="panorama-baseline"
 DOCKER_NOOP_VOLUME="${DOCKER_TAG}-volume"
 
-INPUT_DIR="${SCRIPT_DIR}/test/input"
+INPUT_DIR="${SCRIPT_DIR}/test/input/dicom"
 OUTPUT_DIR="${SCRIPT_DIR}/test/output"
 
 
@@ -42,8 +42,8 @@ docker run --rm \
     --platform=linux/amd64 \
     --shm-size=16g \
     --gpus all \
-    --volume "$INPUT_DIR":/input:ro \
-    --volume "$OUTPUT_DIR":/output \
+    --volume "$INPUT_DIR":/DATA_INPUT:ro \
+    --volume "$OUTPUT_DIR":/DATA_OUTPUT \
     --volume "$DOCKER_NOOP_VOLUME":/tmp \
     $DOCKER_TAG
 docker volume rm "$DOCKER_NOOP_VOLUME"
